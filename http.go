@@ -2,18 +2,19 @@ package otelkit
 
 import (
 	"context"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
 	"net/http"
 )
 
-type WithContextMiddleware struct {
+type HTTPMiddlewareWithContext struct {
 	Next          http.Handler
 	WithContextFn func(context.Context, trace.SpanContext) context.Context
 }
 
-func (mw WithContextMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (mw HTTPMiddlewareWithContext) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sp := trace.SpanContextFromContext(ctx)
 	if sp.IsValid() && mw.WithContextFn != nil {
@@ -22,7 +23,7 @@ func (mw WithContextMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request
 	mw.Next.ServeHTTP(w, r.WithContext(ctx))
 }
 
-type NoTracingWarningMiddleware struct {
+type HTTPMiddlewareNoTracingWarning struct {
 	Next       http.Handler
 	Propagator propagation.TextMapPropagator
 	NotifyFn   func(NoTracingWarningEvent)
@@ -33,7 +34,7 @@ type NoTracingWarningEvent struct {
 	Request        *http.Request
 }
 
-func (mw NoTracingWarningMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (mw HTTPMiddlewareNoTracingWarning) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	spy := &spyHeaderCarrier{HeaderCarrier: propagation.HeaderCarrier(r.Header)}
 	sp := trace.SpanContextFromContext(mw.Propagator.Extract(context.Background(), spy))
 	if !sp.IsValid() {
@@ -43,7 +44,7 @@ func (mw NoTracingWarningMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Re
 	mw.Next.ServeHTTP(w, r)
 }
 
-func (mw NoTracingWarningMiddleware) notify(r *http.Request, missingHeaders []string) {
+func (mw HTTPMiddlewareNoTracingWarning) notify(r *http.Request, missingHeaders []string) {
 	if mw.NotifyFn == nil {
 		return
 	}
@@ -66,7 +67,7 @@ func (s *spyHeaderCarrier) Get(key string) string {
 	return value
 }
 
-type RoundTripper struct {
+type HTTPRoundTripper struct {
 	Next       http.RoundTripper
 	Propagator propagation.TextMapPropagator
 	Tracer     trace.Tracer
@@ -75,7 +76,7 @@ type RoundTripper struct {
 
 const defaultSpanName = "http-request"
 
-func (r RoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+func (r HTTPRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	spanStartOptions := []trace.SpanStartOption{
 		trace.WithAttributes(
 			semconv.HTTPMethodKey.String(request.Method),
@@ -95,4 +96,31 @@ func (r RoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 
 	r.Propagator.Inject(ctx, propagation.HeaderCarrier(request.Header))
 	return r.Next.RoundTrip(request.WithContext(ctx))
+}
+
+func ContextWithBaggage[Member baggage.Member | func() (baggage.Member, error)](
+	ctx context.Context, CorrelationContextData ...Member) (context.Context, error) {
+
+	b := baggage.FromContext(ctx)
+	var err error
+	for _, v := range CorrelationContextData {
+		switch m := any(v).(type) {
+		case baggage.Member:
+			b, err = b.SetMember(m)
+			if err != nil {
+				return nil, err
+			}
+		case func() (baggage.Member, error):
+			member, err := m()
+			if err != nil {
+				return nil, err
+			}
+
+			b, err = b.SetMember(member)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return baggage.ContextWithBaggage(ctx, b), nil
 }

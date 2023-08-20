@@ -11,6 +11,7 @@ import (
 	traceSDK "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"testing"
+	"time"
 )
 
 func TestDebugSpanExporter_smokeTest(t *testing.T) {
@@ -139,6 +140,22 @@ func TestFakeSpanExporter_ExportSpans(t *testing.T) {
 	assert.Contain(t, exp.Pretty(t), "TracerName")
 	assert.Contain(t, exp.Pretty(t), "SpanName")
 	assert.Contain(t, exp.Pretty(t), "EventName")
+}
+
+func TestFakeSpanExporter_ExportedSpans_race(t *testing.T) {
+	var (
+		exp = &otelkit.FakeSpanExporter{}
+		tp  = NewTracerProvider(exp)
+	)
+	testcase.Race(func() {
+		_, span := tp.Tracer("TracerName").Start(context.Background(), "SpanName")
+		span.AddEvent("EventName")
+		span.End()
+	}, func() {
+		assert.EventuallyWithin(time.Second).Assert(t, func(it assert.It) {
+			it.Must.NotEmpty(exp.ExportedSpans())
+		})
+	})
 }
 
 func TestStub(t *testing.T) {

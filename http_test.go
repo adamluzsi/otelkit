@@ -3,12 +3,14 @@ package otelkit_test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"github.com/adamluzsi/otelkit"
 	"github.com/adamluzsi/testcase"
 	"github.com/adamluzsi/testcase/assert"
+	"github.com/adamluzsi/testcase/random"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
+	traceSDK "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"io"
 	"net/http"
@@ -24,7 +26,7 @@ func TestWithContextMiddleware_ServeHTTP(t *testing.T) {
 	withCtxFn := testcase.Var[func(context.Context, trace.SpanContext) context.Context]{ID: "WithContextFn"}
 
 	makeSubject := func(t *testcase.T, next http.Handler) http.Handler {
-		return &otelkit.WithContextMiddleware{
+		return &otelkit.HTTPMiddlewareWithContext{
 			Next:          next,
 			WithContextFn: withCtxFn.Get(t),
 		}
@@ -101,7 +103,7 @@ func TestNoTracingWarningMiddleware_ServeHTTP(t *testing.T) {
 	notifyFn := testcase.Var[func(otelkit.NoTracingWarningEvent)]{ID: "notify that can be used for logging"}
 
 	makeSubject := func(t *testcase.T, next http.Handler) http.Handler {
-		return &otelkit.NoTracingWarningMiddleware{
+		return &otelkit.HTTPMiddlewareNoTracingWarning{
 			Next:       next,
 			Propagator: propagator.Get(t),
 			NotifyFn:   notifyFn.Get(t),
@@ -265,14 +267,6 @@ func (s *StubHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(s.ExpectedResponseCode)
 }
 
-type StubLogger struct {
-	Logs []string
-}
-
-func (l *StubLogger) Print(v ...any) {
-	l.Logs = append(l.Logs, fmt.Sprint(v...))
-}
-
 // TestHighLevel mimics an environment where a microservice,
 // where inbound request contains a traceparent,
 // and outbound request propagates the parent trace id.
@@ -293,7 +287,7 @@ func TestHighLevel(tt *testing.T) {
 	defer nextMicroService.Close()
 
 	c := nextMicroService.Client()
-	c.Transport = otelkit.RoundTripper{
+	c.Transport = otelkit.HTTPRoundTripper{
 		Next:       c.Transport,
 		Propagator: propagator.Get(t),
 		Tracer:     tracer.Get(t),
@@ -321,7 +315,7 @@ func TestHighLevel(tt *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 	})
 
-	withCtxMW := otelkit.WithContextMiddleware{
+	withCtxMW := otelkit.HTTPMiddlewareWithContext{
 		Next: myMicroService,
 		WithContextFn: func(ctx context.Context, sc trace.SpanContext) context.Context {
 			return context.WithValue(ctx, ctxKey{}, sc.TraceID().String())
@@ -341,7 +335,7 @@ func TestHighLevel(tt *testing.T) {
 	t.Must.Equal(http.StatusTeapot, rr.Code)
 }
 
-func TestRoundTripper(t *testing.T) {
+func TestHTTPRoundTripper(t *testing.T) {
 	s := testcase.NewSpec(t)
 	s.NoSideEffect()
 
@@ -351,15 +345,15 @@ func TestRoundTripper(t *testing.T) {
 	spanNameFn := testcase.Var[func(*http.Request) string]{ID: "span name function"}
 
 	makeSubject := func(t *testcase.T, next http.RoundTripper) http.RoundTripper {
-		return otelkit.RoundTripper{
+		return otelkit.HTTPRoundTripper{
 			Next:       next,
 			Propagator: propagator.Get(t),
 			Tracer:     tracer.Get(t),
 			SpanNameFn: spanNameFn.Get(t),
 		}
 	}
-	subject := func(t *testcase.T) otelkit.RoundTripper {
-		return makeSubject(t, nextRoundTripper.Get(t)).(otelkit.RoundTripper)
+	subject := func(t *testcase.T) otelkit.HTTPRoundTripper {
+		return makeSubject(t, nextRoundTripper.Get(t)).(otelkit.HTTPRoundTripper)
 	}
 	act := func(t *testcase.T) (*http.Response, error) {
 		return subject(t).RoundTrip(request.Get(t))
@@ -381,7 +375,7 @@ func TestRoundTripper(t *testing.T) {
 		s.Then("it uses a hard-coded fallback span name", func(t *testcase.T) {
 			onSuccess(t)
 
-			exportedSpans := stubSpanExporter.Get(t).ExportedSpans
+			exportedSpans := stubSpanExporter.Get(t).ExportedSpans()
 			t.Must.NotEmpty(exportedSpans)
 		})
 
@@ -447,7 +441,7 @@ func TestRoundTripper(t *testing.T) {
 				t.Must.Nil(err)
 
 				t.Eventually(func(it assert.It) {
-					exportedSpans := stubSpanExporter.Get(t).ExportedSpans
+					exportedSpans := stubSpanExporter.Get(t).ExportedSpans()
 					it.Must.True(0 < len(exportedSpans))
 					lastSpan := exportedSpans[len(exportedSpans)-1]
 					it.Logf("%#v", lastSpan)
@@ -467,7 +461,7 @@ func TestRoundTripper(t *testing.T) {
 					t.Must.Panic(func() { _, _ = act(t) })
 
 					t.Eventually(func(it assert.It) {
-						exportedSpans := stubSpanExporter.Get(t).ExportedSpans
+						exportedSpans := stubSpanExporter.Get(t).ExportedSpans()
 						it.Must.True(0 < len(exportedSpans))
 						lastSpan := exportedSpans[len(exportedSpans)-1]
 						it.Logf("%#v", lastSpan)
@@ -497,7 +491,7 @@ func ItBehavesLikeARoundTripper(s *testcase.Spec, makeRT func(t *testcase.T, tri
 		stub := testcase.Let(s, func(t *testcase.T) *StubRoundTripper {
 			return &StubRoundTripper{
 				Response: &http.Response{
-					StatusCode: t.Random.ElementFromSlice([]int{
+					StatusCode: t.Random.SliceElement([]int{
 						http.StatusOK,
 						http.StatusTeapot,
 						http.StatusInternalServerError,
@@ -575,4 +569,56 @@ func (f *StubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		panic("oh no!")
 	}
 	return f.Response, f.Err
+}
+
+func TestContextWithBaggage_smoke(t *testing.T) {
+	rnd := random.New(random.CryptoSeed{})
+
+	t.Run("happy", func(t *testing.T) {
+		stub := otelkit.Stub(t)
+
+		ctx, span := stub.TracerProvider.Tracer("tracer").Start(context.Background(), "spanName")
+
+		b := baggage.FromContext(ctx)
+		assert.Equal(t, 0, b.Len())
+
+		key := rnd.StringNC(8, random.CharsetAlpha())
+		val := rnd.StringNC(8, random.CharsetAlpha())
+		prpkey := rnd.StringNC(5, random.CharsetAlpha())
+
+		keyProperty, err := baggage.NewKeyProperty(prpkey)
+		assert.NoError(t, err)
+		member1, err := baggage.NewMember(key, val, keyProperty)
+		assert.NoError(t, err)
+
+		ctx, err = otelkit.ContextWithBaggage(ctx, member1)
+		assert.NoError(t, err)
+
+		ctx, err = otelkit.ContextWithBaggage(ctx, func() (baggage.Member, error) {
+			return baggage.NewMember("m2-key", "m2-value")
+		})
+		assert.NoError(t, err)
+
+		span.End()
+
+		t.Log(stub.SpanExporter.Pretty(t))
+
+		assert.OneOf(t, stub.SpanExporter.ExportedSpans(), func(it assert.It, got traceSDK.ReadOnlySpan) {
+
+		})
+
+	})
+
+	t.Run("rainy", func(t *testing.T) {
+		expErr := rnd.Error()
+		ctx := context.Background()
+
+		_, err := otelkit.ContextWithBaggage(ctx, func() (baggage.Member, error) {
+			return baggage.Member{}, expErr
+		})
+		assert.ErrorIs(t, expErr, err)
+
+		_, err = otelkit.ContextWithBaggage(ctx, baggage.Member{})
+		assert.Error(t, expErr, err)
+	})
 }

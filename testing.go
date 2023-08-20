@@ -10,6 +10,14 @@ import (
 	"sync"
 )
 
+type testingTB interface {
+	Helper()
+	Cleanup(func())
+	Logf(format string, args ...any)
+	Fatalf(format string, args ...any)
+	Errorf(format string, args ...any)
+}
+
 type Stubs struct {
 	SpanExporter   *FakeSpanExporter
 	TracerProvider *traceSDK.TracerProvider
@@ -68,7 +76,7 @@ func prettyPrintExporter(tb testingTB, writer io.Writer) traceSDK.SpanExporter {
 }
 
 type FakeSpanExporter struct {
-	ExportedSpans []traceSDK.ReadOnlySpan
+	spans []traceSDK.ReadOnlySpan
 
 	m sync.Mutex
 }
@@ -76,26 +84,24 @@ type FakeSpanExporter struct {
 func (exp *FakeSpanExporter) ExportSpans(ctx context.Context, spans []traceSDK.ReadOnlySpan) error {
 	exp.m.Lock()
 	defer exp.m.Unlock()
-	exp.ExportedSpans = append(exp.ExportedSpans, spans...)
+	exp.spans = append(exp.spans, spans...)
 	return nil
 }
 
-func (exp *FakeSpanExporter) Shutdown(ctx context.Context) error { return nil }
-
-type testingTB interface {
-	Helper()
-	Cleanup(func())
-	Logf(format string, args ...any)
-	Fatalf(format string, args ...any)
-	Errorf(format string, args ...any)
+func (exp *FakeSpanExporter) ExportedSpans() []traceSDK.ReadOnlySpan {
+	exp.m.Lock()
+	defer exp.m.Unlock()
+	return append([]traceSDK.ReadOnlySpan{}, exp.spans...)
 }
+
+func (exp *FakeSpanExporter) Shutdown(ctx context.Context) error { return nil }
 
 func (exp *FakeSpanExporter) Pretty(tb testingTB) string {
 	exp.m.Lock()
 	defer exp.m.Unlock()
 	tb.Helper()
 	buf := &bytes.Buffer{}
-	if err := prettyPrintExporter(tb, buf).ExportSpans(context.Background(), exp.ExportedSpans); err != nil {
+	if err := prettyPrintExporter(tb, buf).ExportSpans(context.Background(), exp.spans); err != nil {
 		tb.Fatalf("%s", err.Error())
 	}
 	return buf.String()
